@@ -46,6 +46,8 @@ class GIFDecoder() {
     private var imageDescriptor: ImageDescriptor? = null
     private var gce: GCE? = null
 
+    private lateinit var rgba: ByteArray
+
     fun read(filepath: String) {
         try {
             stream = DataInputStream(FileInputStream(filepath))
@@ -63,8 +65,8 @@ class GIFDecoder() {
             height = readShort(stream)
             val fields = stream.read() and 0xFF
             gctFlag = (fields and 0x80) != 0
-//            colorRes = (packedFields and 0x70) shr 4
-//            sortFlag = (packedFields and 0x08) != 0
+//            colorResolution
+//            sortFlag
             colorTableSize = 2.shl(fields and 0x07)
 
             bgIndex = stream.read() and 0xFF
@@ -106,7 +108,29 @@ class GIFDecoder() {
             }
 
             // read image data sub-blocks
-            // uncompress
+            val colorIndexStream = uncompress()
+            rgba = ByteArray(width * height * 4)
+            var toIndex = 0
+            var fromIndex = 0
+            while (fromIndex < colorIndexStream.size) {
+                val colorIndex = colorIndexStream[fromIndex]
+
+                rgba[toIndex + 0] = (globalColorTable!![colorIndex] and 0xff0000).toByte()
+                rgba[toIndex + 1] = (globalColorTable!![colorIndex] and 0x00ff00).toByte()
+                rgba[toIndex + 2] = (globalColorTable!![colorIndex] and 0x0000ff).toByte()
+                rgba[toIndex + 3] = 255.toByte()
+
+                toIndex += 4
+                fromIndex++
+            }
+
+            // output first row of pixels
+            for (p in 0 until width-2) {
+                val r = rgba[p]
+                val g = rgba[p+1]
+                val b = rgba[p+2]
+                println("($r, $g, $b)")
+            }
 
         } catch (e: EOFException) {
             println("Unexpected end of file while parsing GIF")
@@ -116,7 +140,95 @@ class GIFDecoder() {
             stream.close()
         }
     }
+    fun uncompress(): List<Int> {
+        var lzwMinimumCodeSize = stream.read()
+        val clearCode = 1 shl lzwMinimumCodeSize
+        val endCode = clearCode + 1
+        val codeTable = mutableListOf<List<Int>>()
+        (0 until 1.shl(lzwMinimumCodeSize) + 2).forEach { codeTable.add(listOf(it)) }
 
+        var currentCodeSize = lzwMinimumCodeSize + 1
+        var currentReadBits = 0
+        var currentCodeValue = 0
+        var currentSetBitIndexInCodeValue = 0
+        var previousCodeValue = 0
+
+        val indexStream = mutableListOf<Int>()
+        var nextBlockSize = lzwMinimumCodeSize
+
+        do {
+            if (nextBlockSize > 0) {
+                val subblock = ByteArray(nextBlockSize)
+                stream.readFully(subblock)
+
+                for (i in 0 until subblock.size) {
+                    val value = subblock[i].toInt() and 0xff
+
+                    for (shift in 0..7) {
+                        if (value.shr(shift) and 0x1 == 0x1) {
+                            currentCodeValue = currentCodeValue.or(1.shl(currentSetBitIndexInCodeValue))
+                        }
+                        currentReadBits++
+                        currentSetBitIndexInCodeValue++
+
+                        if (currentReadBits == currentCodeSize) {
+                            // we got one code from code stream
+//                                println(currentCodeValue)
+                            if (currentCodeValue == clearCode) {
+                                // reset code table
+                                codeTable.clear()
+                                (0 until 1.shl(lzwMinimumCodeSize) + 2).forEach { codeTable.add(listOf(it)) }
+
+                                currentCodeSize = lzwMinimumCodeSize + 1
+                            } else if (currentCodeValue == endCode) {
+                                println("reach end of information code")
+                            } else {
+                                if (currentCodeValue < codeTable.size && previousCodeValue < codeTable.size) {
+                                    // in code table
+                                    indexStream.addAll(codeTable[currentCodeValue])
+
+                                    if (previousCodeValue != clearCode) {
+                                        val K = codeTable[currentCodeValue][0]
+                                        val toAdded = mutableListOf<Int>()
+                                        toAdded.addAll(codeTable[previousCodeValue])
+                                        toAdded.add(K)
+
+                                        codeTable.add(toAdded)
+                                    }
+
+                                } else {
+                                    // not in code table
+                                    if (previousCodeValue != clearCode && previousCodeValue < codeTable.size) {
+
+                                        val K = codeTable[previousCodeValue][0]
+                                        val toAdded = mutableListOf<Int>()
+                                        toAdded.addAll(codeTable[previousCodeValue])
+                                        toAdded.add(K)
+
+                                        indexStream.addAll(toAdded)
+                                        codeTable.add(toAdded)
+                                    }
+                                }
+                            }
+
+                            previousCodeValue = currentCodeValue
+                            currentCodeValue = 0
+                            currentReadBits = 0
+                            currentSetBitIndexInCodeValue = 0
+                        }
+
+                        if (codeTable.size == 1.shl(currentCodeSize) && currentCodeSize < 12) {
+                            currentCodeSize++
+                        }
+                    }
+                }
+            }
+            nextBlockSize = stream.read()
+        } while (nextBlockSize > 0)
+
+        return indexStream
+    }
+    
     private fun readGraphicsControlExtension(): GCE? {
         val blockLength = stream.readUnsignedByte()
         if (blockLength != 4) {
