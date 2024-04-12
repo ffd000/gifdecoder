@@ -1,7 +1,8 @@
-import java.io.DataInputStream
-import java.io.EOFException
-import java.io.FileInputStream
-import java.io.InputStream
+import java.awt.image.BufferedImage
+import java.io.*
+import javax.imageio.ImageIO
+import java.awt.Color
+import java.io.File
 
 class GIFDecoder() {
     private lateinit var stream: DataInputStream
@@ -67,24 +68,31 @@ class GIFDecoder() {
             gctFlag = (fields and 0x80) != 0
 //            colorResolution
 //            sortFlag
-            colorTableSize = 2.shl(fields and 0x07)
-
+            colorTableSize = 2.shl(fields.and(0x07))
+            println(fields.toString(2))
             bgIndex = stream.read() and 0xFF
             aspectRatio = stream.read() and 0xFF
 
+            println("colorTableSize: $colorTableSize")
+
             // read Global Color Table if present
             if (gctFlag) {
-                println("GCT present")
+                println("using GCT")
                 val size = colorTableSize * 3 // size of color table in bytes (RGB)
+//                globalColorTable = IntArray(size)
+                val test = ByteArray(size)
+                stream.readFully(test)
+                createDebugImage(test, 16, 16, File("test.png"))
 
-                globalColorTable = IntArray(size)
-                for (i in 0..<size step 3) {
-                    val r = stream.readUnsignedByte()
-                    val g = stream.readUnsignedByte()
-                    val b = stream.readUnsignedByte()
-                    globalColorTable!![i] = (r shl 16) or (g shl 8) or b
-                }
+//                for (i in 0..<size step 3) {
+//                    val r = stream.read() and 0xFF
+//                    val g = stream.read() and 0xFF
+//                    val b = stream.read() and 0xFF
+//                    globalColorTable!![i] = 0xff000000.toInt() or (r shl 16) or (g shl 8) or b
+//                }
             }
+
+            return
 
             // read Image Descriptor header
             while (true) {
@@ -103,11 +111,11 @@ class GIFDecoder() {
                         stream.skipBytes(blockSize)
                     }
                 } else if (blockType == TRAILER) {
-                    break
+                    println("trailer")
+                    return
                 }
             }
 
-            // read image data sub-blocks
             val colorIndexStream = uncompress()
             rgba = ByteArray(width * height * 4)
             var toIndex = 0
@@ -115,37 +123,68 @@ class GIFDecoder() {
             while (fromIndex < colorIndexStream.size) {
                 val colorIndex = colorIndexStream[fromIndex]
 
-                rgba[toIndex + 0] = (globalColorTable!![colorIndex] and 0xff0000).toByte()
-                rgba[toIndex + 1] = (globalColorTable!![colorIndex] and 0x00ff00).toByte()
-                rgba[toIndex + 2] = (globalColorTable!![colorIndex] and 0x0000ff).toByte()
+                rgba[toIndex + 0] = (globalColorTable!![colorIndex].shr(16) and 0xff).toByte()
+                rgba[toIndex + 1] = (globalColorTable!![colorIndex].shr(8) and 0xff).toByte()
+                rgba[toIndex + 2] = (globalColorTable!![colorIndex] and 0xff).toByte()
                 rgba[toIndex + 3] = 255.toByte()
 
                 toIndex += 4
                 fromIndex++
             }
 
-            // output first row of pixels
-            for (p in 0 until width-2) {
-                val r = rgba[p]
-                val g = rgba[p+1]
-                val b = rgba[p+2]
-                println("($r, $g, $b)")
-            }
+//            saveImage(rgba, width, height, "output.png")
 
         } catch (e: EOFException) {
             println("Unexpected end of file while parsing GIF")
+            e.printStackTrace()
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             stream.close()
         }
     }
+
+    fun createDebugImage(colorTable: ByteArray, width: Int, height: Int, outputFile: File) {
+        val image = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
+        val numColors = colorTable.size / 3
+
+        val g2d = image.createGraphics()
+        var x = 0
+        var y = 0
+
+        for (i in 0 until 256) {
+            val r = colorTable[i * 3].toInt() and 0xFF
+            val g = colorTable[i * 3 + 1].toInt() and 0xFF
+            val b = colorTable[i * 3 + 2].toInt() and 0xFF
+
+            val color = Color(r, g, b)
+
+            g2d.color = color
+            g2d.fillRect(x, y, 1, 1) // Adjust size as needed
+
+            x += 1
+            if (x >= width) {
+                x = 0
+                y += 1
+            }
+        }
+
+        g2d.dispose()
+        ImageIO.write(image, "PNG", outputFile)
+    }
+
     fun uncompress(): List<Int> {
         var lzwMinimumCodeSize = stream.read()
+
+        if (lzwMinimumCodeSize < 2 || lzwMinimumCodeSize > 8) {
+            println("Incorrect starting Key size: $lzwMinimumCodeSize")
+            return listOf()
+        }
+
         val clearCode = 1 shl lzwMinimumCodeSize
         val endCode = clearCode + 1
         val codeTable = mutableListOf<List<Int>>()
-        (0 until 1.shl(lzwMinimumCodeSize) + 2).forEach { codeTable.add(listOf(it)) }
+        (0 until 1.shl(lzwMinimumCodeSize) + 1).forEach { codeTable.add(listOf(it)) }
 
         var currentCodeSize = lzwMinimumCodeSize + 1
         var currentReadBits = 0
@@ -156,7 +195,7 @@ class GIFDecoder() {
         val indexStream = mutableListOf<Int>()
         var nextBlockSize = lzwMinimumCodeSize
 
-        do {
+        outer@do {
             if (nextBlockSize > 0) {
                 val subblock = ByteArray(nextBlockSize)
                 stream.readFully(subblock)
@@ -173,15 +212,17 @@ class GIFDecoder() {
 
                         if (currentReadBits == currentCodeSize) {
                             // we got one code from code stream
-//                                println(currentCodeValue)
                             if (currentCodeValue == clearCode) {
                                 // reset code table
                                 codeTable.clear()
-                                (0 until 1.shl(lzwMinimumCodeSize) + 2).forEach { codeTable.add(listOf(it)) }
+                                (0 until 1.shl(lzwMinimumCodeSize) + 1).forEach { codeTable.add(listOf(it)) }
 
-                                currentCodeSize = lzwMinimumCodeSize + 1
+                                currentCodeSize = lzwMinimumCodeSize
+                                println("clear")
                             } else if (currentCodeValue == endCode) {
                                 println("reach end of information code")
+
+                                break@outer
                             } else {
                                 if (currentCodeValue < codeTable.size && previousCodeValue < codeTable.size) {
                                     // in code table
@@ -223,7 +264,8 @@ class GIFDecoder() {
                     }
                 }
             }
-            nextBlockSize = stream.read()
+            nextBlockSize = stream.readUnsignedByte()
+            println("$nextBlockSize")
         } while (nextBlockSize > 0)
 
         return indexStream
@@ -269,5 +311,28 @@ fun hex(byteArray: ByteArray) {
 
 fun main() {
     val dec = GIFDecoder()
-    var data = dec.read("cat.gif")
+    var data = dec.read("a.gif")
+}
+fun saveImage(pixels: IntArray, width: Int, height: Int, outputFile: String) {
+    val image = BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB)
+
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            val index = (y * width + x) * 4 // Each pixel has 4 bytes (RGBA)
+            val red = pixels[index].toInt() and 0xFF
+            val green = pixels[index + 1].toInt() and 0xFF
+            val blue = pixels[index + 2].toInt() and 0xFF
+            val alpha = 255
+            val pixel = (alpha shl 24) or (red shl 16) or (green shl 8) or blue
+            image.setRGB(x, y, pixel)
+        }
+    }
+
+    try {
+        val file = File(outputFile)
+        ImageIO.write(image, "png", file)
+        println("Image saved successfully to: ${file.absolutePath}")
+    } catch (e: Exception) {
+        println("Error saving image: ${e.message}")
+    }
 }
